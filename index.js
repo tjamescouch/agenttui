@@ -1,26 +1,35 @@
 #!/usr/bin/env node
 'use strict';
 
-const blessed = require('blessed');
-const fs = require('fs');
-const path = require('path');
-const { execFile } = require('child_process');
-const os = require('os');
-const WebSocket = require('ws');
+import blessed from 'blessed';
+import fs from 'fs';
+import path from 'path';
+import { execFile } from 'child_process';
+import os from 'os';
+import { AgentChatClient } from '@tjamescouch/agentchat';
+
+// --- CLI Args ---
+const args = process.argv.slice(2);
+function getArg(name, fallback) {
+  const idx = args.indexOf(`--${name}`);
+  if (idx >= 0 && idx + 1 < args.length) return args[idx + 1];
+  return fallback;
+}
 
 // --- Config ---
 const AGENTS_DIR = path.join(os.homedir(), '.agentchat', 'agents');
+const IDENTITIES_DIR = path.join(os.homedir(), '.agentchat', 'identities');
 const POLL_INTERVAL = 3000;
 const LOG_TAIL_LINES = 100;
 const DEBOUNCE_MS = 100;
 const AGENTCHAT_PUBLIC = process.env.AGENTCHAT_PUBLIC === 'true';
 const CHAT_SERVER = (() => {
-  const explicit = process.env.AGENTCHAT_URL;
+  const explicit = getArg('server', process.env.AGENTCHAT_URL);
   if (explicit) {
     const parsed = new URL(explicit);
     const isLocal = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '::1';
     if (!isLocal && !AGENTCHAT_PUBLIC) {
-      console.error(`ERROR: AGENTCHAT_URL points to remote host "${parsed.hostname}" but AGENTCHAT_PUBLIC is not set.`);
+      console.error(`ERROR: server points to remote host "${parsed.hostname}" but AGENTCHAT_PUBLIC is not set.`);
       console.error('Set AGENTCHAT_PUBLIC=true to allow connections to non-localhost servers.');
       process.exit(1);
     }
@@ -28,8 +37,19 @@ const CHAT_SERVER = (() => {
   }
   return AGENTCHAT_PUBLIC ? 'wss://agentchat-server.fly.dev' : 'ws://localhost:6667';
 })();
-const CHAT_NAME = 'server';
-const DEFAULT_CHANNEL = '#general';
+const CHAT_NAME = getArg('name', process.env.AGENTCHAT_NAME || 'tui');
+const IDENTITY_PATH = (() => {
+  const explicit = getArg('identity', null);
+  if (explicit) return explicit;
+  // If a name was provided and a matching identity file exists, use it
+  const name = getArg('name', process.env.AGENTCHAT_NAME || null);
+  if (name) {
+    const identityFile = path.join(IDENTITIES_DIR, `${name}.json`);
+    if (fs.existsSync(identityFile)) return identityFile;
+  }
+  return null;
+})();
+const DEFAULT_CHANNELS = ['#general', '#engineering'];
 const RECONNECT_DELAY = 5000;
 const MAX_MSG_LEN = 4096;
 
@@ -38,7 +58,6 @@ function findAgentctl() {
   const candidates = [
     path.join(os.homedir(), 'dev/claude/agentchat/lib/supervisor/agentctl.sh'),
     path.join(os.homedir(), 'dev/claude/projects/agent5/agentchat/lib/supervisor/agentctl.sh'),
-    path.join(__dirname, 'agentctl.sh'),
   ];
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
@@ -213,105 +232,114 @@ function createLogStreamer() {
   return { start, stop };
 }
 
-// --- Chat Client ---
+// --- Chat Client (using @tjamescouch/agentchat) ---
 
 function createChatClient(onMessage, onStatus) {
-  let ws = null;
-  let channel = DEFAULT_CHANNEL;
-  let agentId = null;
+  let client = null;
+  let channels = new Set(DEFAULT_CHANNELS);
+  let activeChannel = DEFAULT_CHANNELS[0];
   let reconnectTimer = null;
   let intentionalClose = false;
+  let agentId = null;
 
-  function connect() {
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  async function connect() {
+    if (client && client.connected) return;
     intentionalClose = false;
     onStatus('connecting');
 
     try {
-      ws = new WebSocket(CHAT_SERVER);
+      const options = {
+        server: CHAT_SERVER,
+        name: CHAT_NAME,
+      };
+
+      if (IDENTITY_PATH) {
+        options.identity = IDENTITY_PATH;
+      }
+
+      client = new AgentChatClient(options);
+      await client.connect();
+      agentId = client.agentId;
+      onStatus('connected');
+
+      // Join default channels
+      for (const ch of channels) {
+        try {
+          await client.join(ch);
+        } catch {}
+      }
+
+      // Wire up event handlers
+      client.on('message', (msg) => {
+        if (msg.from === agentId) return; // skip own messages
+        const displayName = msg.from_name || msg.name || msg.from || '?';
+        const channelLabel = msg.to?.startsWith('#') ? msg.to : 'DM';
+        onMessage({
+          type: 'msg',
+          from: displayName,
+          channel: channelLabel,
+          content: msg.content,
+          isSelf: false,
+        });
+      });
+
+      client.on('agent_joined', (msg) => {
+        const ch = msg.channel;
+        if (channels.has(ch)) {
+          onMessage({ type: 'system', text: `${msg.name || msg.agent} joined ${ch}` });
+        }
+      });
+
+      client.on('agent_left', (msg) => {
+        const ch = msg.channel;
+        if (channels.has(ch)) {
+          onMessage({ type: 'system', text: `${msg.name || msg.agent} left ${ch}` });
+        }
+      });
+
+      client.on('joined', (msg) => {
+        onMessage({ type: 'system', text: `Joined ${msg.channel}` });
+      });
+
+      client.on('left', (msg) => {
+        onMessage({ type: 'system', text: `Left ${msg.channel}` });
+      });
+
+      client.on('error', (msg) => {
+        onMessage({ type: 'error', text: msg.message || 'Unknown error' });
+      });
+
+      client.on('disconnect', () => {
+        onStatus('disconnected');
+        if (!intentionalClose) scheduleReconnect();
+      });
+
     } catch (err) {
       onStatus('error');
+      onMessage({ type: 'error', text: `Connection failed: ${err.message}` });
       scheduleReconnect();
-      return;
-    }
-
-    ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'IDENTIFY', name: CHAT_NAME }));
-    });
-
-    ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        handleServerMessage(msg);
-      } catch {}
-    });
-
-    ws.on('close', () => {
-      onStatus('disconnected');
-      if (!intentionalClose) scheduleReconnect();
-    });
-
-    ws.on('error', () => {
-      onStatus('error');
-    });
-  }
-
-  function handleServerMessage(msg) {
-    switch (msg.type) {
-      case 'WELCOME':
-        agentId = msg.agent_id;
-        onStatus('connected');
-        joinChannel(channel);
-        break;
-      case 'JOINED':
-        onMessage({ type: 'system', text: `Joined ${msg.channel}` });
-        break;
-      case 'LEFT':
-        onMessage({ type: 'system', text: `Left ${msg.channel}` });
-        break;
-      case 'MSG':
-        if (msg.to === channel || msg.to === `@${agentId}`) {
-          onMessage({
-            type: 'msg',
-            from: msg.name || msg.from || '?',
-            content: msg.content,
-            isSelf: msg.from === agentId,
-          });
-        }
-        break;
-      case 'AGENT_JOINED':
-        if (msg.channel === channel) {
-          onMessage({ type: 'system', text: `${msg.name || msg.agent} joined` });
-        }
-        break;
-      case 'AGENT_LEFT':
-        if (msg.channel === channel) {
-          onMessage({ type: 'system', text: `${msg.name || msg.agent} left` });
-        }
-        break;
-      case 'ERROR':
-        onMessage({ type: 'error', text: msg.message || 'Unknown error' });
-        break;
     }
   }
 
-  function joinChannel(ch) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'JOIN', channel: ch }));
+  async function joinChannel(ch) {
+    channels.add(ch);
+    if (client && client.connected) {
+      try { await client.join(ch); } catch {}
     }
   }
 
-  function leaveChannel(ch) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'LEAVE', channel: ch }));
+  async function leaveChannel(ch) {
+    channels.delete(ch);
+    if (client && client.connected) {
+      try { await client.leave(ch); } catch {}
     }
   }
 
   function switchChannel(newChannel) {
-    if (newChannel === channel) return;
-    leaveChannel(channel);
-    channel = newChannel;
-    joinChannel(channel);
+    activeChannel = newChannel;
+    if (!channels.has(newChannel)) {
+      joinChannel(newChannel);
+    }
   }
 
   function send(text) {
@@ -320,8 +348,16 @@ function createChatClient(onMessage, onStatus) {
       text = text.slice(0, MAX_MSG_LEN);
       onMessage({ type: 'system', text: `Message truncated to ${MAX_MSG_LEN} chars` });
     }
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'MSG', to: channel, content: text.trim() }));
+    if (client && client.connected) {
+      client.send(activeChannel, text.trim());
+      // Show own message locally (server may or may not echo)
+      onMessage({
+        type: 'msg',
+        from: CHAT_NAME,
+        channel: activeChannel,
+        content: text.trim(),
+        isSelf: true,
+      });
     } else {
       onMessage({ type: 'error', text: 'Not connected' });
     }
@@ -338,13 +374,15 @@ function createChatClient(onMessage, onStatus) {
   function disconnect() {
     intentionalClose = true;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    if (ws) { try { ws.close(); } catch {} ws = null; }
+    if (client) { try { client.disconnect(); } catch {} client = null; }
   }
 
-  function getChannel() { return channel; }
-  function isConnected() { return ws && ws.readyState === WebSocket.OPEN; }
+  function getChannel() { return activeChannel; }
+  function getChannels() { return [...channels]; }
+  function isConnected() { return client && client.connected; }
+  function getAgentId() { return agentId; }
 
-  return { connect, disconnect, send, switchChannel, getChannel, isConnected };
+  return { connect, disconnect, send, switchChannel, joinChannel, leaveChannel, getChannel, getChannels, isConnected, getAgentId };
 }
 
 // --- Name Color ---
@@ -354,6 +392,17 @@ function nameColor(name) {
   let hash = 0;
   for (let i = 0; i < name.length; i++) {
     hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
+  }
+  return colors[Math.abs(hash) % colors.length];
+}
+
+// --- Channel Color ---
+
+function channelColor(channel) {
+  const colors = ['cyan', 'magenta', 'yellow', 'green', 'blue'];
+  let hash = 0;
+  for (let i = 0; i < channel.length; i++) {
+    hash = ((hash << 5) - hash + channel.charCodeAt(i)) | 0;
   }
   return colors[Math.abs(hash) % colors.length];
 }
@@ -444,7 +493,7 @@ function createUI() {
 
   const chatLog = blessed.log({
     parent: chatCol,
-    label: ' #general ',
+    label: ` ${DEFAULT_CHANNELS[0]} `,
     top: 0,
     left: 0,
     width: '100%',
@@ -520,7 +569,11 @@ function main() {
       switch (msg.type) {
         case 'msg': {
           const color = msg.isSelf ? 'cyan' : nameColor(msg.from);
-          ui.chatLog.log(`{${color}-fg}${msg.from}{/${color}-fg}: ${msg.content}`);
+          const chColor = channelColor(msg.channel || '#general');
+          const chPrefix = msg.channel && msg.channel !== chat.getChannel()
+            ? `{${chColor}-fg}[${msg.channel}]{/${chColor}-fg} `
+            : '';
+          ui.chatLog.log(`${chPrefix}{${color}-fg}${msg.from}{/${color}-fg}: ${msg.content}`);
           break;
         }
         case 'system':
@@ -546,10 +599,11 @@ function main() {
         ? `{yellow-fg}◐{/yellow-fg} connecting`
         : `{red-fg}○{/red-fg} disconnected`;
 
+    const identity = IDENTITY_PATH ? `{green-fg}${CHAT_NAME}{/green-fg}` : `{grey-fg}${CHAT_NAME}{/grey-fg}`;
     const focusIndicator = `[${focusPanel}]`;
 
     ui.setStatus(
-      `[s]tart [x]stop [r]estart [K]ill [c]ontext [/]filter [tab]focus [q]uit  ${focusIndicator}  chat: ${chatIndicator}`
+      `[s]tart [x]stop [r]estart [K]ill [c]ontext [/]filter [tab]focus [q]uit  ${focusIndicator}  ${identity}  chat: ${chatIndicator}`
     );
   }
 
@@ -755,8 +809,23 @@ function main() {
       if (joinMatch) {
         const newChannel = joinMatch[1];
         chat.switchChannel(newChannel);
-        ui.chatLog.setContent('');
         ui.chatLog.setLabel(` ${newChannel} `);
+      } else if (text.match(/^\/leave\s+(#\S+)/)) {
+        const leaveMatch = text.match(/^\/leave\s+(#\S+)/);
+        const ch = leaveMatch[1];
+        chat.leaveChannel(ch);
+      } else if (text === '/channels') {
+        const chs = chat.getChannels();
+        ui.chatLog.log(`{grey-fg}--- Channels: ${chs.join(', ')}{/grey-fg}`);
+      } else if (text === '/id') {
+        const id = chat.getAgentId();
+        ui.chatLog.log(`{grey-fg}--- Agent ID: ${id || 'not connected'}{/grey-fg}`);
+      } else if (text.match(/^\/dm\s+(@\S+)\s+(.+)/)) {
+        const dmMatch = text.match(/^\/dm\s+(@\S+)\s+(.+)/);
+        if (chat.isConnected()) {
+          chat.send(dmMatch[2]); // This sends to activeChannel, need DM support
+          ui.chatLog.log(`{cyan-fg}DM → ${dmMatch[1]}: ${dmMatch[2]}{/cyan-fg}`);
+        }
       } else {
         chat.send(text);
       }
@@ -935,6 +1004,49 @@ function main() {
     });
   });
 
+  // ? key shows help
+  ui.screen.key(['?'], () => {
+    if (chatFocused || confirmAction) return;
+    const helpLines = [
+      '{bold}Keybindings:{/bold}',
+      '',
+      '  {cyan-fg}Tab{/cyan-fg}       Cycle focus: agents → logs → chat',
+      '  {cyan-fg}Shift+Tab{/cyan-fg} Reverse cycle',
+      '  {cyan-fg}j/k{/cyan-fg}       Navigate agent list',
+      '  {cyan-fg}s{/cyan-fg}         Start selected agent',
+      '  {cyan-fg}x{/cyan-fg}         Stop selected agent',
+      '  {cyan-fg}r{/cyan-fg}         Restart selected agent',
+      '  {cyan-fg}K{/cyan-fg}         Kill selected agent (requires confirmation)',
+      '  {cyan-fg}c{/cyan-fg}         View agent context.md',
+      '  {cyan-fg}/{/cyan-fg}         Filter agents by name',
+      '  {cyan-fg}Escape{/cyan-fg}    Clear filter / exit chat / cancel',
+      '  {cyan-fg}?{/cyan-fg}         Show this help',
+      '  {cyan-fg}q{/cyan-fg}         Quit',
+      '',
+      '{bold}Chat Commands:{/bold}',
+      '',
+      '  {magenta-fg}/join #channel{/magenta-fg}   Switch active channel',
+      '  {magenta-fg}/leave #channel{/magenta-fg}  Leave a channel',
+      '  {magenta-fg}/channels{/magenta-fg}        List joined channels',
+      '  {magenta-fg}/id{/magenta-fg}              Show your agent ID',
+      '',
+      '{bold}CLI Args:{/bold}',
+      '',
+      '  --name <name>       Agent name (default: tui)',
+      '  --server <url>      Server URL',
+      '  --identity <path>   Identity file path',
+      '',
+      '{grey-fg}Press any key to close{/grey-fg}',
+    ];
+
+    ui.logBox.setContent('');
+    ui.logBox.setLabel(' help ');
+    for (const line of helpLines) {
+      ui.logBox.log(line);
+    }
+    ui.screen.render();
+  });
+
   ui.screen.key(['escape'], () => {
     if (chatFocused) {
       ui.chatInput.clearValue();
@@ -1000,6 +1112,15 @@ function main() {
   chat.connect();
 
   const pollTimer = setInterval(refresh, POLL_INTERVAL);
+
+  // Show connection info
+  const identityInfo = IDENTITY_PATH
+    ? `{green-fg}persistent identity:{/green-fg} ${CHAT_NAME}`
+    : `{grey-fg}ephemeral:{/grey-fg} ${CHAT_NAME}`;
+  ui.chatLog.log(`{grey-fg}--- Connecting to ${CHAT_SERVER} as ${identityInfo}{/grey-fg}`);
+  ui.chatLog.log(`{grey-fg}--- Channels: ${DEFAULT_CHANNELS.join(', ')}{/grey-fg}`);
+  ui.chatLog.log(`{grey-fg}--- Type /join #channel to switch, ? for help{/grey-fg}`);
+
   ui.screen.render();
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "agentctl-tui",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Interactive terminal dashboard for managing supervised claude agents",
   "main": "index.js",
   "bin": {
@@ -12,9 +12,9 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
+  "type": "module",
   "dependencies": {
-    "blessed": "^0.1.81",
-    "ws": "^8.19.0"
+    "@tjamescouch/agentchat": "^0.24.3",
+    "blessed": "^0.1.81"
   }
 }
