@@ -306,7 +306,12 @@ function createChatClient(onMessage, onStatus) {
       });
 
       client.on('error', (msg) => {
-        onMessage({ type: 'error', text: msg.message || 'Unknown error' });
+        const text = msg.message || 'Unknown error';
+        // Suppress noisy channel join errors (channel not found, already joined, etc.)
+        const suppress = /channel.*not found|not a member|already/i.test(text);
+        if (!suppress) {
+          onMessage({ type: 'error', text });
+        }
       });
 
       client.on('disconnect', () => {
