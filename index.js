@@ -84,11 +84,14 @@ function resolveStatus(agentDir) {
           process.kill(pid, 0);
           return 'running';
         } catch {
-          return 'dead';
+          // PID is stale (process doesn't exist) — clean up
+          try { fs.unlinkSync(pidFile); } catch {}
+          return 'stopped';
         }
       }
     } catch {}
-    return 'dead';
+    try { fs.unlinkSync(pidFile); } catch {}
+    return 'stopped';
   }
 
   if (fs.existsSync(stateFile)) {
@@ -321,7 +324,10 @@ function createChatClient(onMessage, onStatus) {
 
     } catch (err) {
       onStatus('error');
-      onMessage({ type: 'error', text: `Connection failed: ${err.message}` });
+      const hint = CHAT_SERVER.includes('localhost') || CHAT_SERVER.includes('127.0.0.1')
+        ? ` (connecting to ${CHAT_SERVER} — did you mean to set AGENTCHAT_PUBLIC=true?)`
+        : '';
+      onMessage({ type: 'error', text: `Connection failed: ${err.message}${hint}` });
       scheduleReconnect();
     }
   }
@@ -370,6 +376,7 @@ function createChatClient(onMessage, onStatus) {
 
   function scheduleReconnect() {
     if (reconnectTimer) return;
+    onMessage({ type: 'system', text: `Reconnecting in ${RECONNECT_DELAY / 1000}s...` });
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connect();
