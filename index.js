@@ -4,7 +4,7 @@
 import blessed from 'blessed';
 import fs from 'fs';
 import path from 'path';
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import os from 'os';
 import { AgentChatClient } from '@tjamescouch/agentchat';
 
@@ -55,13 +55,27 @@ const MAX_MSG_LEN = 4096;
 
 // --- Find agentctl.sh ---
 function findAgentctl() {
+  // Check explicit env var first
+  if (process.env.AGENTCTL_PATH && fs.existsSync(process.env.AGENTCTL_PATH)) {
+    return process.env.AGENTCTL_PATH;
+  }
+
+  // Check common locations
   const candidates = [
     path.join(os.homedir(), 'dev/claude/agentchat/lib/supervisor/agentctl.sh'),
     path.join(os.homedir(), 'dev/claude/projects/agent5/agentchat/lib/supervisor/agentctl.sh'),
+    path.join(os.homedir(), '.agentchat/agentctl.sh'),
   ];
   for (const p of candidates) {
     if (fs.existsSync(p)) return p;
   }
+
+  // Try PATH lookup
+  try {
+    const result = execFileSync('which', ['agentctl.sh'], { encoding: 'utf8', timeout: 3000 }).trim();
+    if (result && fs.existsSync(result)) return result;
+  } catch {}
+
   return null;
 }
 
@@ -260,28 +274,24 @@ function createChatClient(onMessage, onStatus) {
         options.identity = IDENTITY_PATH;
       }
 
-      client = new AgentChatClient(options);
-      await client.connect();
-      agentId = client.agentId;
-      onStatus('connected');
-
-      // Join default channels
-      for (const ch of channels) {
-        try {
-          await client.join(ch);
-        } catch {}
+      // Clean up old client before creating new one
+      if (client) {
+        try { client.removeAllListeners(); client.disconnect(); } catch {}
+        client = null;
       }
 
-      // Wire up event handlers
+      client = new AgentChatClient(options);
+
+      // Wire up event handlers BEFORE connect to avoid race conditions
       client.on('message', (msg) => {
         if (msg.from === agentId) return; // skip own messages
-        const displayName = msg.from_name || msg.name || msg.from || '?';
+        const displayName = escapeTags(msg.from_name || msg.name || msg.from || '?');
         const channelLabel = msg.to?.startsWith('#') ? msg.to : 'DM';
         onMessage({
           type: 'msg',
           from: displayName,
           channel: channelLabel,
-          content: msg.content,
+          content: escapeTags(msg.content),
           isSelf: false,
         });
       });
@@ -321,6 +331,17 @@ function createChatClient(onMessage, onStatus) {
         onStatus('disconnected');
         if (!intentionalClose) scheduleReconnect();
       });
+
+      await client.connect();
+      agentId = client.agentId;
+      onStatus('connected');
+
+      // Join default channels
+      for (const ch of channels) {
+        try {
+          await client.join(ch);
+        } catch {}
+      }
 
     } catch (err) {
       onStatus('error');
@@ -374,6 +395,26 @@ function createChatClient(onMessage, onStatus) {
     }
   }
 
+  function dm(target, text) {
+    if (!text || !text.trim()) return;
+    if (text.length > MAX_MSG_LEN) {
+      text = text.slice(0, MAX_MSG_LEN);
+      onMessage({ type: 'system', text: `Message truncated to ${MAX_MSG_LEN} chars` });
+    }
+    if (client && client.connected) {
+      client.send(target, text.trim());
+      onMessage({
+        type: 'msg',
+        from: CHAT_NAME,
+        channel: 'DM',
+        content: `→ ${target}: ${text.trim()}`,
+        isSelf: true,
+      });
+    } else {
+      onMessage({ type: 'error', text: 'Not connected' });
+    }
+  }
+
   function scheduleReconnect() {
     if (reconnectTimer) return;
     onMessage({ type: 'system', text: `Reconnecting in ${RECONNECT_DELAY / 1000}s...` });
@@ -394,7 +435,14 @@ function createChatClient(onMessage, onStatus) {
   function isConnected() { return client && client.connected; }
   function getAgentId() { return agentId; }
 
-  return { connect, disconnect, send, switchChannel, joinChannel, leaveChannel, getChannel, getChannels, isConnected, getAgentId };
+  return { connect, disconnect, send, dm, switchChannel, joinChannel, leaveChannel, getChannel, getChannels, isConnected, getAgentId };
+}
+
+// --- Sanitize blessed tags in untrusted content ---
+
+function escapeTags(str) {
+  if (!str) return str;
+  return str.replace(/\{/g, '\\{').replace(/\}/g, '\\}');
 }
 
 // --- Name Color ---
@@ -822,8 +870,9 @@ function main() {
         const newChannel = joinMatch[1];
         chat.switchChannel(newChannel);
         ui.chatLog.setLabel(` ${newChannel} `);
-      } else if (text.match(/^\/leave\s+(#\S+)/)) {
+      } else if (text.startsWith('/leave ')) {
         const leaveMatch = text.match(/^\/leave\s+(#\S+)/);
+        if (!leaveMatch) return;
         const ch = leaveMatch[1];
         chat.leaveChannel(ch);
       } else if (text === '/channels') {
@@ -835,8 +884,9 @@ function main() {
       } else if (text.match(/^\/dm\s+(@\S+)\s+(.+)/)) {
         const dmMatch = text.match(/^\/dm\s+(@\S+)\s+(.+)/);
         if (chat.isConnected()) {
-          chat.send(dmMatch[2]); // This sends to activeChannel, need DM support
-          ui.chatLog.log(`{cyan-fg}DM → ${dmMatch[1]}: ${dmMatch[2]}{/cyan-fg}`);
+          chat.dm(dmMatch[1], dmMatch[2]);
+        } else {
+          ui.chatLog.log(`{red-fg}! Not connected{/red-fg}`);
         }
       } else {
         chat.send(text);
@@ -1112,6 +1162,7 @@ function main() {
   });
 
   function cleanup() {
+    clearInterval(pollTimer);
     logStreamer.stop();
     chat.disconnect();
     process.exit(0);
