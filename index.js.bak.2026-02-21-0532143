@@ -1274,10 +1274,6 @@ function renderAgentList() {
   ui.chatLog.log(`{grey-fg}--- Connecting to ${CHAT_SERVER} as ${identityInfo}{/grey-fg}`);
   ui.chatLog.log(`{grey-fg}--- Channels: ${DEFAULT_CHANNELS.join(', ')}{/grey-fg}`);
   ui.chatLog.log(`{grey-fg}--- Type /join #channel to switch, ? for help{/grey-fg}`);
-  // Helpful hint when defaulting to local server — users often expect remote connectivity.
-  if (!AGENTCHAT_PUBLIC && !AGENTTUI_ALLOW_REMOTE && (CHAT_SERVER.includes('127.0.0.1') || CHAT_SERVER.includes('localhost'))) {
-    ui.chatLog.log(`{yellow-fg}--- Note: agenttui is configured to connect to a local AgentChat server (${CHAT_SERVER}). If you intended to connect to the public server, run with {bold}AGENTTUI_ALLOW_REMOTE=1 --server wss://agentchat-server.fly.dev{/bold} or set {bold}AGENTCHAT_PUBLIC=true{/bold}.{\/yellow-fg}`);
-  }
 
   ui.screen.render();
 }

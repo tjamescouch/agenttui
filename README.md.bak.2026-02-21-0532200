@@ -142,16 +142,3 @@ node index.js --allow-remote --server wss://agentchat-server.fly.dev
 ```
 
 This is intentional: AgentTUI is an admin tool and should not be casually pointed at remote servers.
-
-If you're seeing connection failures and expect to connect to the hosted AgentChat server, run:
-
-```bash
-AGENTTUI_ALLOW_REMOTE=1 node index.js --server wss://agentchat-server.fly.dev
-```
-
-or set environment variable:
-
-```bash
-export AGENTCHAT_PUBLIC=true
-node index.js --server wss://agentchat-server.fly.dev
-```
