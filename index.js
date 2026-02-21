@@ -362,6 +362,8 @@ function createChatClient(onMessage, onStatus) {
 
       await client.connect();
       agentId = client.agentId;
+      // If a reconnect was scheduled, clear it now that we've connected.
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
       onStatus('connected');
 
       // Join default channels
