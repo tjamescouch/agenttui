@@ -264,6 +264,7 @@ function createChatClient(onMessage, onStatus) {
   let agentId = null;
   // Simple in-memory dedupe cache for recently-seen messages to avoid duplicates
   // caused by server echoes or transient reconnects. Keys expire after a short window.
+  const MSG_DEDUPE_WINDOW_MS = 3000; // how long to remember message keys
   const recentMsgKeys = new Map(); // key -> timeoutId
 
   async function connect() {
@@ -305,8 +306,8 @@ function createChatClient(onMessage, onStatus) {
         }
 
         if (key) {
-          // remember for 3s
-          const t = setTimeout(() => recentMsgKeys.delete(key), 3000);
+          // remember for configured window
+          const t = setTimeout(() => recentMsgKeys.delete(key), MSG_DEDUPE_WINDOW_MS);
           recentMsgKeys.set(key, t);
         }
 
