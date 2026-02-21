@@ -697,10 +697,41 @@ function main() {
     }
   }
 
-  function renderAgentList() {
-    filteredAgents = agents.filter(a =>
-      !filterText || a.name.toLowerCase().includes(filterText.toLowerCase())
-    );
+function renderAgentList() {
+    // If no filter, show all agents.
+    if (!filterText) {
+      filteredAgents = agents.slice();
+    } else {
+      // Use a lightweight fuzzy matching algorithm to rank results.
+      const q = filterText.toLowerCase();
+      function fuzzyScore(needle, hay) {
+        // Simple sequential fuzzy match. Returns score (higher is better) or 0 if no match.
+        needle = needle.toLowerCase();
+        hay = hay.toLowerCase();
+        let n = 0;
+        let lastIdx = -1;
+        for (let i = 0; i < needle.length; i++) {
+          const ch = needle[i];
+          const idx = hay.indexOf(ch, lastIdx + 1);
+          if (idx === -1) return 0;
+          // reward for consecutive matches
+          if (idx === lastIdx + 1) n += 5;
+          else n += 1;
+          lastIdx = idx;
+        }
+        // shorter haystack preferred
+        n += Math.max(0, 10 - hay.length);
+        return n;
+      }
+
+      const withScores = agents.map(a => ({
+        a,
+        score: Math.max(fuzzyScore(q, a.name), fuzzyScore(q, a.dir || ''))
+      })).filter(x => x.score > 0);
+
+      withScores.sort((x, y) => y.score - x.score || x.a.name.localeCompare(y.a.name));
+      filteredAgents = withScores.map(x => x.a);
+    }
 
     const items = filteredAgents.map(a => {
       const icon = statusIcon(a.status);
