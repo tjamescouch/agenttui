@@ -929,6 +929,7 @@ function renderAgentList() {
     }
 
     ui.chatInput.clearValue();
+    // keep focus in chat after submit
     rearmChatInput();
   });
 
@@ -1211,6 +1212,14 @@ function renderAgentList() {
     const order = ['agents', 'logs', 'chat'];
     const idx = order.indexOf(focusPanel);
     setFocus(order[(idx - 1 + order.length) % order.length]);
+  });
+
+  // Enter should open the chat input when chat panel is focused (usability fix)
+  ui.screen.key(['enter'], () => {
+    if (confirmAction) return;
+    if (focusPanel === 'chat') {
+      setFocus('chat');
+    }
   });
 
   // Mouse copy mode — toggle blessed mouse capture off so terminal can select text natively
