@@ -262,6 +262,9 @@ function createChatClient(onMessage, onStatus) {
   let reconnectTimer = null;
   let intentionalClose = false;
   let agentId = null;
+  // Simple in-memory dedupe cache for recently-seen messages to avoid duplicates
+  // caused by server echoes or transient reconnects. Keys expire after a short window.
+  const recentMsgKeys = new Map(); // key -> timeoutId
 
   async function connect() {
     if (client && client.connected) return;
@@ -288,7 +291,28 @@ function createChatClient(onMessage, onStatus) {
 
       // Wire up event handlers BEFORE connect to avoid race conditions
       client.on('message', (msg) => {
-        if (msg.from === agentId) return; // skip own messages
+        // Try to use a server-provided unique id if available
+        const keyParts = [];
+        if (msg.id) keyParts.push(msg.id);
+        if (msg.from) keyParts.push(msg.from);
+        if (msg.to) keyParts.push(msg.to);
+        if (msg.content) keyParts.push(String(msg.content).slice(0, 256));
+        const key = keyParts.join('|');
+
+        if (key && recentMsgKeys.has(key)) {
+          // duplicate within short window — ignore
+          return;
+        }
+
+        if (key) {
+          // remember for 3s
+          const t = setTimeout(() => recentMsgKeys.delete(key), 3000);
+          recentMsgKeys.set(key, t);
+        }
+
+        // If the server indicates this message is from ourselves, skip — but be conservative
+        if (msg.from && agentId && msg.from === agentId) return;
+
         const displayName = escapeTags(msg.from_name || msg.name || msg.from || '?');
         const channelLabel = msg.to?.startsWith('#') ? msg.to : 'DM';
         onMessage({
